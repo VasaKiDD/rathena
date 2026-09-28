@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+#
+# setup-macos.sh - install, configure, build and run a local rAthena server
+# (Renewal or Pre-renewal) on macOS (Apple Silicon or Intel) with Homebrew and
+# MariaDB.
+#
+# Usage: ./setup-macos.sh [command]
+#
+#   all        deps, db, build, config, start, then print a summary (default)
+#   deps       install Homebrew packages (mariadb, pcre)
+#   db         start MariaDB, create the database and user, import the schema,
+#              create the GM account
+#   build      ./configure (Renewal or Pre-renewal, see MODE) and make server
+#   config     write the local settings into conf/import/
+#   start      start login, char, map and web servers in the background
+#   stop       stop the servers
+#   restart    stop, then start
+#   status     show MariaDB, process and port status
+#   logs NAME  follow log/NAME-server.log (NAME: login, char, map, web)
+#   check      run ./map-server --run-once to validate the db and NPC scripts
+#   reset-db   drop the database and import it again
+#
+# Every step can be re-run. Settings can be overridden with environment
+# variables, for example: PACKETVER=20250618 ./setup-macos.sh build
+#
+# PACKETVER defaults to the version of the last build, or 20130618 on the
+# first build. 20130618 matches the public roBrowser assets that
+# ../play-ro.command uses. See ../switch_to_2025_protocol.md for 2025.
+#
+# MODE is 'renewal' or 'prere' (Pre-renewal). Like PACKETVER it defaults to
+# the mode of the last build, or renewal on the first build. Each mode has its
+# own database (ragnarok, ragnarok_prere), so accounts and characters of one
+# mode are never loaded by the other. Switch with, for example:
+#   MODE=prere ./setup-macos.sh all
+#
+# Only the managed block in each conf/import/ file is rewritten. Anything else
+# you put in those files is kept.
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+ROOT=$(pwd)
+
+BUILD_DIR="$ROOT/build/macos"
+STAMP="$BUILD_DIR/configure.args"
+
+# An explicit PACKETVER wins, then the one the server was last built with.
+if [ -z "${PACKETVER:-}" ]; then
+	PACKETVER=$(grep -o 'packetver=[0-9]*' "$STAMP" 2>/dev/null | cut -d= -f2 || true)
+	PACKETVER=${PACKETVER:-20130618}
+fi
+# Same for MODE: explicit, then the last build, then renewal.
+if [ -z "${MODE:-}" ]; then
+	MODE=renewal
+	grep -qx -- '--enable-prere=yes' "$STAMP" 2>/dev/null && MODE=prere
+fi
+case $MODE in
+	renewal) MODE_LABEL=Renewal DEFAULT_DB=ragnarok ;;
+	prere) MODE_LABEL=Pre-renewal DEFAULT_DB=ragnarok_prere ;;
+	*)
+		echo "error: MODE must be 'renewal' or 'prere', not '$MODE'" >&2
+		exit 1
+		;;
+esac
+DB_NAME=${DB_NAME:-$DEFAULT_DB}
+DB_USER=${DB_USER:-ragnarok}
+DB_PASS=${DB_PASS:-ragnarok}
+# Leave empty to connect as the macOS user through the MariaDB socket (Homebrew default).
+DB_ROOT_USER=${DB_ROOT_USER:-}
+DB_ROOT_PASS=${DB_ROOT_PASS:-}
+GM_USER=${GM_USER:-admin}
+GM_PASS=${GM_PASS:-admin}
+SERVER_NAME=${SERVER_NAME:-rAthena}
+# Where new Pre-renewal characters start. rAthena's default is the novice grounds
+# (new_1-1 .. new_5-1), which the public roBrowser assets don't include.
+START_POINT_PRE=${START_POINT_PRE:-prontera,156,191}
+# Address the char and map servers advertise to clients.
+SERVER_IP=${SERVER_IP:-127.0.0.1}
+# Address the servers listen on. Use 0.0.0.0 to accept connections from the network.
+BIND_IP=${BIND_IP:-127.0.0.1}
+# Origin allowed to call the web server (roBrowserLegacy Vite dev server).
+CORS_ORIGIN=${CORS_ORIGIN:-http://localhost:3000}
+JOBS=${JOBS:-$(sysctl -n hw.ncpu)}
+START_TIMEOUT=${START_TIMEOUT:-120}
+
+SERVERS="login-server char-server map-server web-server"
+MARK_BEGIN='// >>> setup-macos.sh: managed block, rewritten on every run'
+MARK_END='// <<< setup-macos.sh'
+
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die() {
+	printf '\033[1;31merror:\033[0m %s\n' "$*" >&2
+	exit 1
+}
+
+server_port() {
+	case $1 in
+		login-server) echo 6900 ;;
+		char-server) echo 6121 ;;
+		map-server) echo 5121 ;;
+		web-server) echo 8888 ;;
+	esac
+}
+
+# Prints the PID of a server started by athena-start, if it is still running.
+server_pid() {
+	local pidfile=".$1.pid" pid
+	[ -f "$pidfile" ] || return 1
+	pid=$(cat "$pidfile")
+	[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+	echo "$pid"
+}
+
+port_listening() {
+	lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+any_server_running() {
+	local s
+	for s in $SERVERS; do
+		server_pid "$s" >/dev/null && return 0
+	done
+	return 1
+}
+
+load_brew() {
+	local b
+	if ! command -v brew >/dev/null 2>&1; then
+		for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+			if [ -x "$b" ]; then
+				eval "$("$b" shellenv)"
+				break
+			fi
+		done
+	fi
+	command -v brew >/dev/null 2>&1 || die "Homebrew is required, see https://brew.sh"
+}
+
+# Escapes a value for use inside a single-quoted SQL string.
+sql_str() {
+	local s=${1//\\/\\\\}
+	printf '%s' "${s//\'/\'\'}"
+}
+
+admin_sql() {
+	local args=()
+	if [ -n "$DB_ROOT_USER" ]; then
+		args+=(-u "$DB_ROOT_USER")
+		[ -n "$DB_ROOT_PASS" ] && args+=("-p$DB_ROOT_PASS")
+	fi
+	mariadb ${args[@]+"${args[@]}"} "$@"
+}
+
+# Rewrites the managed block at the end of a conf/import file, keeping the rest.
+write_block() {
+	local file=$1
+	shift
+	if [ -f "$file" ]; then
+		awk -v b="$MARK_BEGIN" -v e="$MARK_END" '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' "$file" >"$file.tmp"
+	else
+		: >"$file.tmp"
+	fi
+	{
+		echo "$MARK_BEGIN"
+		printf '%s\n' "$@"
+		echo "$MARK_END"
+	} >>"$file.tmp"
+	mv "$file.tmp" "$file"
+}
+
+cmd_deps() {
+	local pkg
+	xcode-select -p >/dev/null 2>&1 || die "Xcode Command Line Tools are missing. Run: xcode-select --install"
+	load_brew
+	if brew list --formula mysql >/dev/null 2>&1; then
+		warn "Homebrew mysql is installed. It conflicts with mariadb; run 'brew services stop mysql && brew unlink mysql' first."
+	fi
+	for pkg in mariadb pcre; do
+		if brew list --formula "$pkg" >/dev/null 2>&1; then
+			info "$pkg is already installed"
+		else
+			info "Installing $pkg"
+			brew install "$pkg"
+		fi
+	done
+}
+
+wait_mariadb() {
+	local i
+	for i in $(seq 1 30); do
+		mariadb-admin ping >/dev/null 2>&1 && return 0
+		sleep 1
+	done
+	die "MariaDB did not start. See $(brew --prefix)/var/mysql/*.err"
+}
+
+start_mariadb() {
+	local cnf
+	load_brew
+	command -v mariadb >/dev/null 2>&1 || die "MariaDB is not installed. Run: $0 deps"
+
+	# Some MariaDB bottles listen on every interface. rAthena only needs loopback.
+	cnf="$(brew --prefix)/etc/my.cnf.d/rathena-localhost.cnf"
+	if [ ! -f "$cnf" ]; then
+		info "Binding MariaDB to 127.0.0.1 ($cnf)"
+		mkdir -p "$(dirname "$cnf")"
+		printf '# Written by rathena/setup-macos.sh\n[mysqld]\nbind-address = 127.0.0.1\n' >"$cnf"
+		if mariadb-admin ping >/dev/null 2>&1; then
+			brew services restart mariadb
+			wait_mariadb
+			return 0
+		fi
+	fi
+
+	mariadb-admin ping >/dev/null 2>&1 && return 0
+	if port_listening 3306; then
+		die "Port 3306 is used by another process (the roBrowserLegacy Docker database?). Stop it, then run this again:
+$(lsof -nP -iTCP:3306 -sTCP:LISTEN)"
+	fi
+	info "Starting MariaDB"
+	brew services start mariadb
+	wait_mariadb
+}
+
+table_exists() {
+	[ "$(admin_sql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$(sql_str "$DB_NAME")' AND table_name = '$1';")" != 0 ]
+}
+
+cmd_db() {
+	local user pass name file last
+	start_mariadb
+	admin_sql -e "SELECT 1;" >/dev/null 2>&1 ||
+		die "Cannot log in to MariaDB as '${DB_ROOT_USER:-$USER}'. Set DB_ROOT_USER and DB_ROOT_PASS to an admin account."
+
+	info "Creating database '$DB_NAME' and user '$DB_USER'"
+	user=$(sql_str "$DB_USER")
+	pass=$(sql_str "$DB_PASS")
+	name=${DB_NAME//\`/}
+	admin_sql <<-SQL
+		CREATE DATABASE IF NOT EXISTS \`$name\`;
+		CREATE USER IF NOT EXISTS '$user'@'localhost' IDENTIFIED BY '$pass';
+		CREATE USER IF NOT EXISTS '$user'@'127.0.0.1' IDENTIFIED BY '$pass';
+		ALTER USER '$user'@'localhost' IDENTIFIED BY '$pass';
+		ALTER USER '$user'@'127.0.0.1' IDENTIFIED BY '$pass';
+		GRANT ALL PRIVILEGES ON \`$name\`.* TO '$user'@'localhost';
+		GRANT ALL PRIVILEGES ON \`$name\`.* TO '$user'@'127.0.0.1';
+		FLUSH PRIVILEGES;
+	SQL
+
+	# Each file is imported unless the last table it creates already exists.
+	# item_db*.sql and mob_db*.sql are only used with use_sql_db: yes, so they are skipped.
+	for file in main.sql logs.sql web.sql; do
+		last=$(grep -o 'CREATE TABLE IF NOT EXISTS `[^`]*`' "sql-files/$file" | tail -1 | cut -d'`' -f2)
+		if table_exists "$last"; then
+			info "sql-files/$file is already imported"
+		else
+			info "Importing sql-files/$file"
+			admin_sql "$name" <"sql-files/$file"
+		fi
+	done
+	if [ "$(admin_sql -N "$name" -e 'SELECT COUNT(*) FROM db_roulette;')" = 0 ]; then
+		info "Importing sql-files/roulette_default_data.sql"
+		admin_sql "$name" <sql-files/roulette_default_data.sql
+	fi
+
+	if [ -n "$GM_USER" ]; then
+		user=$(sql_str "$GM_USER")
+		if [ "$(admin_sql -N "$name" -e "SELECT COUNT(*) FROM login WHERE userid = '$user';")" = 0 ]; then
+			info "Creating GM account '$GM_USER' (group 99)"
+			admin_sql "$name" -e "INSERT INTO login (userid, user_pass, sex, email, group_id) VALUES ('$user', '$(sql_str "$GM_PASS")', 'M', 'admin@localhost', 99);"
+		else
+			info "GM account '$GM_USER' already exists"
+		fi
+	fi
+}
+
+cmd_build() {
+	local mysql_config mariadb_lib ldflags="" wanted s
+	local args=()
+	load_brew
+	mkdir -p "$BUILD_DIR"
+
+	mysql_config=$(brew --prefix mariadb)/bin/mysql_config
+	[ -x "$mysql_config" ] || mysql_config=$(brew --prefix mariadb)/bin/mariadb_config
+	[ -x "$mysql_config" ] || die "mysql_config not found. Run: $0 deps"
+
+	# configure links against -lmysqlclient. MariaDB normally provides it as a
+	# symlink to libmariadb; add one in build/ if this install lacks it.
+	mariadb_lib=$("$mysql_config" --variable=pkglibdir 2>/dev/null || true)
+	[ -d "$mariadb_lib" ] || mariadb_lib=$(brew --prefix mariadb)/lib
+	if ! ls "$mariadb_lib"/libmysqlclient.* >/dev/null 2>&1; then
+		[ -e "$mariadb_lib/libmariadb.dylib" ] || die "libmariadb.dylib not found in $mariadb_lib"
+		mkdir -p "$BUILD_DIR/lib"
+		ln -sf "$mariadb_lib/libmariadb.dylib" "$BUILD_DIR/lib/libmysqlclient.dylib"
+		ldflags="-L$BUILD_DIR/lib"
+	fi
+
+	args=(--enable-packetver="$PACKETVER" --with-mysql="$mysql_config" --with-pcre="$(brew --prefix pcre)")
+	# Renewal is rAthena's default; --enable-prere=yes defines PRERE (db/pre-re, npc/pre-re).
+	[ "$MODE" = prere ] && args+=(--enable-prere=yes)
+	wanted=$(printf '%s\n' "${args[@]}" "LDFLAGS=$ldflags")
+
+	if [ ! -f Makefile ] || [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$wanted" ]; then
+		info "Configuring a $MODE_LABEL build with PACKETVER=$PACKETVER"
+		if ! LDFLAGS="$ldflags" ./configure "${args[@]}" >"$BUILD_DIR/configure.log" 2>&1; then
+			tail -n 30 "$BUILD_DIR/configure.log" >&2
+			die "configure failed, see $BUILD_DIR/configure.log"
+		fi
+		info "Removing objects from the previous configuration"
+		make clean >/dev/null
+		printf '%s\n' "$wanted" >"$STAMP"
+	else
+		info "Already configured: $MODE_LABEL, PACKETVER=$PACKETVER"
+	fi
+
+	info "Building servers with $JOBS jobs"
+	make -j"$JOBS" server
+	for s in $SERVERS; do
+		[ -x "$s" ] || die "Build finished but ./$s is missing"
+	done
+	info "Build complete"
+}
+
+cmd_config() {
+	local dir f
+	# Same as 'make import': copy templates without overwriting existing files.
+	for dir in conf/import conf/msg_conf/import db/import; do
+		mkdir -p "$dir"
+		for f in "$dir-tmpl"/*; do
+			[ -e "$dir/$(basename "$f")" ] || cp "$f" "$dir/"
+		done
+	done
+
+	info "Writing conf/import settings"
+	write_block conf/import/inter_conf.txt \
+		"login_server_ip: 127.0.0.1" "login_server_port: 3306" "login_server_id: $DB_USER" "login_server_pw: $DB_PASS" "login_server_db: $DB_NAME" \
+		"ipban_db_ip: 127.0.0.1" "ipban_db_port: 3306" "ipban_db_id: $DB_USER" "ipban_db_pw: $DB_PASS" "ipban_db_db: $DB_NAME" \
+		"char_server_ip: 127.0.0.1" "char_server_port: 3306" "char_server_id: $DB_USER" "char_server_pw: $DB_PASS" "char_server_db: $DB_NAME" \
+		"map_server_ip: 127.0.0.1" "map_server_port: 3306" "map_server_id: $DB_USER" "map_server_pw: $DB_PASS" "map_server_db: $DB_NAME" \
+		"web_server_ip: 127.0.0.1" "web_server_port: 3306" "web_server_id: $DB_USER" "web_server_pw: $DB_PASS" "web_server_db: $DB_NAME" \
+		"log_db_ip: 127.0.0.1" "log_db_port: 3306" "log_db_id: $DB_USER" "log_db_pw: $DB_PASS" "log_db_db: $DB_NAME"
+	# new_account lets clients register with the _M/_F suffix.
+	# Every client and the char server connect from 127.0.0.1, so a password-failure
+	# ban would lock out the whole server, including the char server's own login link.
+	write_block conf/import/login_conf.txt "bind_ip: $BIND_IP" "new_account: yes" "ipban_dynamic_pass_failure_ban: no"
+	# Same reason: exempt loopback from the flood (DDoS) protection of all servers.
+	write_block conf/import/packet_conf.txt "allow: 127.0.0.1"
+	# start_point_pre is only read by Pre-renewal builds. PINs like 0000 or 1234
+	# are refused by default; on a local server they're fine.
+	write_block conf/import/char_conf.txt "bind_ip: $BIND_IP" "server_name: $SERVER_NAME" "login_ip: 127.0.0.1" "char_ip: $SERVER_IP" \
+		"start_point_pre: $START_POINT_PRE" "pincode_allow_repeated: yes" "pincode_allow_sequential: yes"
+	write_block conf/import/map_conf.txt "bind_ip: $BIND_IP" "char_ip: 127.0.0.1" "map_ip: $SERVER_IP"
+	write_block conf/import/web_conf.txt "bind_ip: $BIND_IP" "allowed_origin_cors: $CORS_ORIGIN"
+}
+
+# Each mode has its own database: create it on first use and point conf/import at it.
+prepare_runtime() {
+	start_mariadb
+	table_exists login || cmd_db
+	cmd_config
+}
+
+cmd_start() {
+	local s pid port elapsed=0 pending built=renewal
+	for s in $SERVERS; do
+		[ -x "$s" ] || die "./$s is missing. Run: $0 build"
+	done
+	grep -qx -- '--enable-prere=yes' "$STAMP" 2>/dev/null && built=prere
+	[ "$built" = "$MODE" ] || die "The servers were built in $built mode, not $MODE. Run: MODE=$MODE $0 build"
+	if any_server_running; then
+		warn "Servers are already running"
+		cmd_status
+		return 0
+	fi
+	for s in $SERVERS; do
+		port=$(server_port "$s")
+		port_listening "$port" && die "Port $port is already in use:
+$(lsof -nP -iTCP:"$port" -sTCP:LISTEN)"
+	done
+	prepare_runtime
+
+	info "Starting servers (logs in log/)"
+	mkdir -p log
+	ulimit -S -n 4096 2>/dev/null || true
+	nohup ./athena-start start --enlog >/dev/null 2>&1 </dev/null
+
+	while :; do
+		pending=""
+		for s in $SERVERS; do
+			if ! pid=$(server_pid "$s"); then
+				tail -n 30 "log/$s.log" >&2 2>/dev/null || true
+				die "$s exited during startup, see log/$s.log"
+			fi
+			port_listening "$(server_port "$s")" || pending="$pending $s"
+		done
+		[ -z "$pending" ] && break
+		if [ "$elapsed" -ge "$START_TIMEOUT" ]; then
+			for s in $pending; do
+				tail -n 20 "log/$s.log" >&2 2>/dev/null || true
+			done
+			die "Still waiting for:$pending after ${START_TIMEOUT}s. See log/"
+		fi
+		sleep 2
+		elapsed=$((elapsed + 2))
+	done
+	info "All servers are up"
+}
+
+cmd_stop() {
+	if ! any_server_running; then
+		info "Servers are not running"
+		rm -f .login-server.pid .char-server.pid .map-server.pid .web-server.pid
+		return 0
+	fi
+	info "Stopping servers"
+	./athena-start stop
+	rm -f ./*_fifo
+}
+
+cmd_status() {
+	local s pid state
+	load_brew
+	if command -v mariadb-admin >/dev/null 2>&1 && mariadb-admin ping >/dev/null 2>&1; then
+		echo "MariaDB       running"
+	else
+		echo "MariaDB       stopped"
+	fi
+	for s in $SERVERS; do
+		if pid=$(server_pid "$s"); then
+			state="running (pid $pid)"
+			port_listening "$(server_port "$s")" && state="$state, listening on $(server_port "$s")"
+		else
+			state="stopped"
+		fi
+		printf '%-13s %s\n' "$s" "$state"
+	done
+}
+
+cmd_logs() {
+	local log="log/${1%-server}-server.log"
+	[ -f "$log" ] || die "$log does not exist (servers not started with this script yet?)"
+	tail -n 50 -f "$log"
+}
+
+cmd_check() {
+	[ -x map-server ] || die "./map-server is missing. Run: $0 build"
+	server_pid map-server >/dev/null && die "Stop the servers first: $0 stop"
+	prepare_runtime
+	mkdir -p log
+	info "Loading every db file and NPC script (map-server --run-once)"
+	if ./map-server --run-once >log/map-server.runonce.log 2>&1; then
+		grep -E '\[(Error|Warning)\]' log/map-server.runonce.log | tail -n 20 || true
+		info "map-server --run-once passed (full output in log/map-server.runonce.log)"
+	else
+		tail -n 30 log/map-server.runonce.log >&2
+		die "map-server --run-once failed, see log/map-server.runonce.log"
+	fi
+}
+
+cmd_reset_db() {
+	local answer
+	any_server_running && die "Stop the servers first: $0 stop"
+	start_mariadb
+	read -r -p "This deletes every account and character in '$DB_NAME'. Type the database name to confirm: " answer
+	[ "$answer" = "$DB_NAME" ] || die "Aborted"
+	admin_sql -e "DROP DATABASE IF EXISTS \`${DB_NAME//\`/}\`;"
+	cmd_db
+}
+
+print_summary() {
+	cat <<-EOF
+
+		rAthena ($MODE_LABEL, PACKETVER $PACKETVER, database $DB_NAME) is running on $BIND_IP
+		  login 6900   char 6121   map 5121   web 8888
+		  GM account:  $GM_USER / $GM_PASS (group 99)
+		  Register:    log in with <name>_M or <name>_F to create an account
+		  Logs:        $0 logs login|char|map|web
+		  Stop:        $0 stop
+
+		To play in Chrome with roBrowserLegacy, run ../play-ro.command.
+	EOF
+}
+
+case ${1:-all} in
+	all)
+		cmd_deps
+		cmd_db
+		cmd_build
+		cmd_start
+		print_summary
+		;;
+	deps) cmd_deps ;;
+	db) cmd_db ;;
+	build) cmd_build ;;
+	config) cmd_config ;;
+	start) cmd_start ;;
+	stop) cmd_stop ;;
+	restart)
+		cmd_stop
+		cmd_start
+		;;
+	status) cmd_status ;;
+	logs) cmd_logs "${2:-map}" ;;
+	check) cmd_check ;;
+	reset-db) cmd_reset_db ;;
+	-h | --help | help) sed -n '3,/^$/{s/^# \{0,1\}//;p;}' "$0" ;;
+	*) die "Unknown command '$1'. Run: $0 help" ;;
+esac
